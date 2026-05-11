@@ -1,0 +1,254 @@
+substitutions:
+  device_name: qbus-desk
+  friendly_name: Qbus Desk
+  ticks_per_cm: "102.93"
+  cm_at_zero:   "60.29"
+  max_ticks: "6669"
+  min_ticks: "888"
+  max_hold_seconds: "30s"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+  baud_rate: 0
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name} fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+web_server:
+  port: 80
+
+globals:
+  - id: prev_position
+    type: int
+    restore_value: no
+    initial_value: '-1'
+
+uart:
+  - id: lin_rx
+    rx_pin: GPIO16
+    baud_rate: 19200
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    rx_buffer_size: 512
+    debug:
+      direction: RX
+      dummy_receiver: true
+      after:
+        timeout: 5ms
+        bytes: 100
+      sequence:
+        - lambda: |-
+            constexpr float TICKS_PER_CM = ${ticks_per_cm}f;
+            constexpr float CM_AT_ZERO   = ${cm_at_zero}f;
+            constexpr int   MAX_TICKS    = ${max_ticks};
+            constexpr int   MIN_TICKS    = ${min_ticks};
+
+            for (size_t i = 0; i + 5 < bytes.size(); i++) {
+              if (bytes[i] != 0x55 || bytes[i+1] != 0x92) continue;
+
+              uint16_t pos   = (uint16_t(bytes[i+3]) << 8) | bytes[i+2];
+              uint8_t  state = bytes[i+4];
+
+              if (pos > 20000) { i += 5; continue; }
+
+              float height_cm = (float)pos / TICKS_PER_CM + CM_AT_ZERO;
+              id(desk_position).publish_state(pos);
+              id(desk_height).publish_state(height_cm);
+
+              int prev = id(prev_position);
+
+              if ((int)pos >= MAX_TICKS && id(btn_up_sw).state) {
+                ESP_LOGW("endstop", "TOP limit hit (pos=%u)", pos);
+                id(btn_up_sw).turn_off();
+              }
+              if ((int)pos <= MIN_TICKS && id(btn_down_sw).state) {
+                ESP_LOGW("endstop", "BOTTOM soft limit hit (pos=%u)", pos);
+                id(btn_down_sw).turn_off();
+              }
+
+              bool descending = (prev >= 0 && (int)pos < prev);
+              if (descending && (int)pos <= MIN_TICKS && !id(btn_down_sw).state) {
+                ESP_LOGW("safety", "Physical DOWN past limit (pos=%u), blocking", pos);
+                id(safety_block_down).execute();
+              }
+
+              std::string movement = "idle";
+              bool is_moving = (state != 0x05 && state != 0x44 && state != 0x00);
+              if (is_moving && prev >= 0) {
+                if      ((int)pos > prev) movement = "up";
+                else if ((int)pos < prev) movement = "down";
+                else                       movement = id(desk_movement).state;
+              }
+              id(prev_position) = (int)pos;
+
+              if (id(desk_movement).state != movement) {
+                id(desk_movement).publish_state(movement);
+              }
+
+              i += 5;
+            }
+
+script:
+  - id: safety_block_down
+    mode: restart
+    then:
+      - output.turn_on: btn_up_out
+      - delay: 500ms
+      - if:
+          condition:
+            switch.is_off: btn_up_sw
+          then:
+            - output.turn_off: btn_up_out
+
+sensor:
+  - platform: template
+    id: desk_position
+    name: "Desk Position"
+    unit_of_measurement: "ticks"
+    accuracy_decimals: 0
+    icon: mdi:counter
+    update_interval: never
+
+  - platform: template
+    id: desk_height
+    name: "Desk Height"
+    unit_of_measurement: "cm"
+    accuracy_decimals: 1
+    icon: mdi:human-male-height-variant
+    update_interval: never
+
+text_sensor:
+  - platform: template
+    id: desk_movement
+    name: "Desk Movement"
+    icon: mdi:arrow-up-down
+    lambda: 'return std::string("idle");'
+    update_interval: never
+
+binary_sensor:
+  - platform: template
+    id: desk_at_top
+    name: "Desk At Top"
+    icon: mdi:arrow-collapse-up
+    lambda: |-
+      if (std::isnan(id(desk_position).state)) return false;
+      return (int)id(desk_position).state >= ${max_ticks};
+
+  - platform: template
+    id: desk_at_bottom
+    name: "Desk At Soft Bottom"
+    icon: mdi:arrow-collapse-down
+    lambda: |-
+      if (std::isnan(id(desk_position).state)) return false;
+      return (int)id(desk_position).state <= ${min_ticks};
+
+output:
+  - platform: gpio
+    pin: { number: GPIO26, mode: { output: true, open_drain: true } }
+    inverted: true
+    id: btn_up_out
+  - platform: gpio
+    pin: { number: GPIO27, mode: { output: true, open_drain: true } }
+    inverted: true
+    id: btn_down_out
+  - platform: gpio
+    pin: { number: GPIO33, mode: { output: true, open_drain: true } }
+    inverted: true
+    id: btn_m1_out
+  - platform: gpio
+    pin: { number: GPIO32, mode: { output: true, open_drain: true } }
+    inverted: true
+    id: btn_m2_out
+
+switch:
+  - platform: template
+    name: "Desk Up"
+    id: btn_up_sw
+    icon: mdi:arrow-up-bold
+    optimistic: true
+    turn_on_action:
+      - if:
+          condition:
+            lambda: |-
+              if (std::isnan(id(desk_position).state)) return true;
+              return (int)id(desk_position).state < ${max_ticks};
+          then:
+            - output.turn_on: btn_up_out
+            - delay: ${max_hold_seconds}
+            - output.turn_off: btn_up_out
+            - switch.template.publish:
+                id: btn_up_sw
+                state: OFF
+          else:
+            - logger.log: "Desk Up blocked - at top limit"
+            - switch.template.publish:
+                id: btn_up_sw
+                state: OFF
+    turn_off_action:
+      - output.turn_off: btn_up_out
+
+  - platform: template
+    name: "Desk Down"
+    id: btn_down_sw
+    icon: mdi:arrow-down-bold
+    optimistic: true
+    turn_on_action:
+      - if:
+          condition:
+            lambda: |-
+              if (std::isnan(id(desk_position).state)) return true;
+              return (int)id(desk_position).state > ${min_ticks};
+          then:
+            - output.turn_on: btn_down_out
+            - delay: ${max_hold_seconds}
+            - output.turn_off: btn_down_out
+            - switch.template.publish:
+                id: btn_down_sw
+                state: OFF
+          else:
+            - logger.log: "Desk Down blocked - at bottom limit"
+            - switch.template.publish:
+                id: btn_down_sw
+                state: OFF
+    turn_off_action:
+      - output.turn_off: btn_down_out
+
+button:
+  - platform: template
+    name: "Desk M1"
+    icon: mdi:numeric-1-box
+    on_press:
+      - output.turn_on: btn_m1_out
+      - delay: 200ms
+      - output.turn_off: btn_m1_out
+  - platform: template
+    name: "Desk M2"
+    icon: mdi:numeric-2-box
+    on_press:
+      - output.turn_on: btn_m2_out
+      - delay: 200ms
+      - output.turn_off: btn_m2_out

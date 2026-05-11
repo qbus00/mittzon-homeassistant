@@ -1,0 +1,23 @@
+# ESPHome build artifacts
+.esphome/
+**/.pioenvs/
+**/.piolibdeps/
+
+# Secrets
+secrets.yaml
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Sigrok captures (large, stored in GitHub Releases)
+captures/*.sr
