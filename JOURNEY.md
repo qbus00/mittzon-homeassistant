@@ -134,6 +134,30 @@ The desk is fully controllable from Home Assistant with live height tracking, sa
 
 Total hardware cost beyond the desk: an ESP32 and some wire. Powered directly from the desk's 5V rail.
 
+## Attempt 6: Go-to-position — three tries at predictive stop
+
+With button emulation and position feedback working, the next obvious step was "set a target height and let the ESP drive there automatically." This turned out to be harder than expected.
+
+### v1: Stop when close enough
+
+The first attempt used a simple tolerance window: drive UP or DOWN, and stop when `abs(current_position - target) <= tolerance`. This caused consistent undershoot. The desk would enter the tolerance window while still moving, the ESP would release the button, and the desk would coast past where it stopped — but the stop point was already short of the target because the window was too generous. Making the tolerance tighter helped, but then the desk would sometimes oscillate — overshoot, reverse, overshoot the other way.
+
+### v2: Stop when position crosses target
+
+The second attempt removed the tolerance window entirely and just drove until the position crossed the target tick value. This was more predictable but caused ~1cm overshoot every time. The desk was still under power when the position sensor reported crossing the target, and motor inertia carried it further. The LIN bus position feedback runs at ~10Hz — at desk speed, that's a new reading every ~5mm of travel. By the time we see the crossing, the desk has already moved past.
+
+### v3: Predictive stop with runtime-tunable inertia compensation
+
+The working approach releases the drive button *before* reaching the target, letting motor inertia coast the desk the rest of the way. The key insight: the coast distance is roughly constant for a given desk load and direction, so we can compensate for it.
+
+The ESP releases UP when position reaches `target - inertia_compensation` (going up) or releases DOWN at `target + inertia_compensation` (going down). The `inertia_compensation` value is exposed as a runtime HA slider (0-300 ticks, default 100 which is roughly 1cm), so tuning doesn't require a reflash.
+
+Direction matters because gravity assists downward motion (longer coast) and resists upward motion (shorter coast). In practice, a single compensation value works well enough for both directions on a lightly loaded desk, but the slider lets users dial it in for their specific setup.
+
+### Why native presets are still more accurate
+
+The M1/M2 memory presets on the physical panel achieve ~0.1cm precision. That's not because the motor or mechanics are better — it's the same motor. The ROL Group controller has internal encoder feedback running at ~1kHz with a tight PID loop. Our position feedback comes over the LIN bus at ~10Hz, giving us a new position reading roughly every 5mm of travel at full speed. That 100x difference in feedback rate is the fundamental limit. After tuning the inertia compensation slider, go-to-position lands within +/-2mm of the target, which is more than good enough for a standing desk.
+
 ## Lessons learned
 
 1. **Understand the physical layer before writing code.** The open-collector AND behavior made injection impossible, and we didn't realize it until after building the MITM hardware. A few minutes with the LIN spec would have saved hours.

@@ -6,16 +6,18 @@ Control an IKEA Mittzon standing desk from Home Assistant using an ESP32 wired d
 
 - **UP / DOWN** control from Home Assistant switches
 - **Memory preset** buttons (M1, M2) via HA button entities
+- **Go-to-position** — set target height in cm via HA slider, ESP drives the desk there with predictive stop (+/-2mm precision after tuning)
 - **Live height tracking** (cm + raw encoder ticks) via LIN bus RX monitoring
 - **Movement state** sensor (idle / up / down)
 - **End-stop protection** — soft limits prevent driving past safe range
 - **Physical button safety** — if someone presses DOWN past the limit on the panel, ESP fires UP to trigger the controller's "two buttons = STOP" behavior
 - **Deadman timer** — 30s max hold, auto-release
 
+<!-- [ADD SCREENSHOT: HA dashboard showing desk controls, height slider, and targeting state] -->
+
 ## What doesn't work (yet)
 
 - Full LIN bus control (iDrive proprietary checksum not cracked — see [PROTOCOL.md](PROTOCOL.md))
-- Go-to-position automation (would need LIN injection or timed drive with position feedback)
 - Panel LED status reading
 
 ## Quick start
@@ -28,6 +30,16 @@ Control an IKEA Mittzon standing desk from Home Assistant using an ESP32 wired d
 6. Flash and add to Home Assistant
 
 See [HARDWARE.md](HARDWARE.md) for full wiring details and panel teardown instructions.
+
+### Tuning inertia compensation
+
+The go-to-position feature releases the drive button slightly before the target to let the desk coast to a stop via motor inertia. The `Desk Inertia Compensation` slider (0-300 ticks, default 100) controls how early the release happens.
+
+- If the desk consistently **overshoots** the target: increase the value
+- If it **undershoots**: decrease it
+- The sweet spot depends on your desk's load and friction — start at 100 and adjust in steps of 10-20
+
+No reflash needed — the slider is a runtime HA entity.
 
 ## Hardware
 
@@ -76,11 +88,15 @@ RJ45 GND  ------------ ESP32 GND
 | Desk Down | Switch | Hold to lower, release to stop |
 | Desk M1 | Button | Momentary press for memory 1 |
 | Desk M2 | Button | Momentary press for memory 2 |
+| Desk Target Height | Number / Slider | Set target height in cm (69-125), ESP drives to position |
+| Desk Inertia Compensation | Number / Slider | Tune predictive stop distance (0-300 ticks, default 100) |
 | Desk Height | Sensor | Current height in cm |
 | Desk Position | Sensor | Raw encoder ticks |
 | Desk Movement | Text Sensor | idle / up / down |
 | Desk At Top | Binary Sensor | At upper end-stop |
 | Desk At Soft Bottom | Binary Sensor | At lower soft limit |
+| Desk Targeting | Binary Sensor | True while driving toward target |
+| Desk Stop Targeting | Button | Abort current go-to-position |
 
 ## The journey
 

@@ -1,10 +1,20 @@
 substitutions:
   device_name: qbus-desk
   friendly_name: Qbus Desk
+
+  # === Kalibracja enkodera ===
   ticks_per_cm: "102.93"
   cm_at_zero:   "60.29"
-  max_ticks: "6669"
-  min_ticks: "888"
+
+  # === Limity ===
+  max_ticks: "6669"   # górny limit (~125 cm)
+  min_ticks: "888"    # dolny soft limit (uważaj na fotel)
+
+  # === Target height range w cm ===
+  min_height_cm: "69"
+  max_height_cm: "125"
+
+  # === Safety timeout ===
   max_hold_seconds: "30s"
 
 esphome:
@@ -40,12 +50,28 @@ ota:
 web_server:
   port: 80
 
+# ─────────────────────────────────────────
+# Stan między ramkami + targeting
+# ─────────────────────────────────────────
 globals:
   - id: prev_position
     type: int
     restore_value: no
     initial_value: '-1'
 
+  - id: target_ticks
+    type: int
+    restore_value: yes
+    initial_value: '3000'
+
+  - id: targeting_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+# ─────────────────────────────────────────
+# LIN RX - monitor + end-stop + auto-recovery + targeting
+# ─────────────────────────────────────────
 uart:
   - id: lin_rx
     rx_pin: GPIO16
@@ -66,6 +92,18 @@ uart:
             constexpr float CM_AT_ZERO   = ${cm_at_zero}f;
             constexpr int   MAX_TICKS    = ${max_ticks};
             constexpr int   MIN_TICKS    = ${min_ticks};
+            constexpr int   HYSTERESIS   = 30;
+            constexpr uint32_t STUCK_TIMEOUT_MS = 1500;
+            constexpr uint32_t RESET_PULSE_MS  = 500;
+
+            static uint32_t last_motion_time = 0;
+            static int      last_recorded_pos = -1;
+            static bool     in_reset_pulse = false;
+            static uint32_t reset_pulse_start = 0;
+
+            // Targeting state (across iterations)
+            static int      target_initial_pos = -1;
+            static bool     target_was_active = false;
 
             for (size_t i = 0; i + 5 < bytes.size(); i++) {
               if (bytes[i] != 0x55 || bytes[i+1] != 0x92) continue;
@@ -80,7 +118,14 @@ uart:
               id(desk_height).publish_state(height_cm);
 
               int prev = id(prev_position);
+              uint32_t now = millis();
 
+              if (last_recorded_pos != (int)pos) {
+                last_recorded_pos = (int)pos;
+                last_motion_time = now;
+              }
+
+              // === End-stop ESP-driven motion (HA switches) ===
               if ((int)pos >= MAX_TICKS && id(btn_up_sw).state) {
                 ESP_LOGW("endstop", "TOP limit hit (pos=%u)", pos);
                 id(btn_up_sw).turn_off();
@@ -90,12 +135,100 @@ uart:
                 id(btn_down_sw).turn_off();
               }
 
-              bool descending = (prev >= 0 && (int)pos < prev);
-              if (descending && (int)pos <= MIN_TICKS && !id(btn_down_sw).state) {
-                ESP_LOGW("safety", "Physical DOWN past limit (pos=%u), blocking", pos);
-                id(safety_block_down).execute();
+              bool below_min = ((int)pos < MIN_TICKS);
+              bool ha_wants_up = id(btn_up_sw).state;
+              bool ha_wants_down = id(btn_down_sw).state;
+
+              // ═══════════════════════════════════════
+              // PRIORITY 1: Safety + auto-recovery (poniżej MIN)
+              // ═══════════════════════════════════════
+              if (below_min && !ha_wants_up) {
+                // Cancel targeting if below safety limit
+                if (id(targeting_active)) {
+                  id(targeting_active) = false;
+                  ESP_LOGW("target", "Cancelled - below safety");
+                }
+
+                if (in_reset_pulse) {
+                  if (now - reset_pulse_start >= RESET_PULSE_MS) {
+                    in_reset_pulse = false;
+                    id(btn_up_out).turn_on();
+                    last_motion_time = now;
+                    ESP_LOGW("safety", "Reset done, UP re-asserted");
+                  }
+                } else {
+                  uint32_t stuck_time = now - last_motion_time;
+                  if (stuck_time > STUCK_TIMEOUT_MS && last_motion_time > 0) {
+                    id(btn_up_out).turn_off();
+                    in_reset_pulse = true;
+                    reset_pulse_start = now;
+                    ESP_LOGW("safety", "Stuck %ums, release pulse", stuck_time);
+                  } else {
+                    id(btn_up_out).turn_on();
+                  }
+                }
+              }
+              // ═══════════════════════════════════════
+              // PRIORITY 2: Targeting mode (gdy nie ma HA-driven motion)
+              // Strategia: zwolnij przycisk INERTIA_TICKS przed targetem.
+              // Biurko z inercji doleci do targetu samo.
+              // INERTIA_TICKS konfigurowalne na żywo z HA przez slider.
+              // ═══════════════════════════════════════
+              else if (id(targeting_active) && !ha_wants_up && !ha_wants_down) {
+                int target = id(target_ticks);
+                int inertia = (int)id(inertia_compensation).state;
+
+                // Detect targeting start
+                if (!target_was_active) {
+                  target_initial_pos = (int)pos;
+                  ESP_LOGI("target", "Started: initial=%d, target=%d (%s), inertia=%d",
+                           target_initial_pos, target,
+                           target > target_initial_pos ? "UP" : "DOWN",
+                           inertia);
+                }
+                target_was_active = true;
+
+                bool going_up = (target > target_initial_pos);
+                int stop_at = going_up ? (target - inertia) : (target + inertia);
+                bool reached_stop_point = going_up
+                    ? ((int)pos >= stop_at)
+                    : ((int)pos <= stop_at);
+
+                if (reached_stop_point) {
+                  id(btn_up_out).turn_off();
+                  id(btn_down_out).turn_off();
+                  id(targeting_active) = false;
+                  target_was_active = false;
+                  ESP_LOGI("target", "Released at pos=%u (target=%d, coast=%d)",
+                           pos, target, target - (int)pos);
+                } else if (going_up && (int)pos < MAX_TICKS) {
+                  id(btn_up_out).turn_on();
+                  id(btn_down_out).turn_off();
+                } else if (!going_up && (int)pos > MIN_TICKS) {
+                  id(btn_down_out).turn_on();
+                  id(btn_up_out).turn_off();
+                } else {
+                  id(targeting_active) = false;
+                  target_was_active = false;
+                  id(btn_up_out).turn_off();
+                  id(btn_down_out).turn_off();
+                  ESP_LOGW("target", "Aborted - past safety limit");
+                }
               }
 
+              // Reset targeting state when externally cancelled
+              if (!id(targeting_active) && target_was_active) {
+                target_was_active = false;
+              }
+              // ═══════════════════════════════════════
+              // PRIORITY 3: Above min + hysteresis - release safety
+              // ═══════════════════════════════════════
+              else if ((int)pos >= MIN_TICKS + HYSTERESIS && !ha_wants_up && !id(targeting_active)) {
+                in_reset_pulse = false;
+                id(btn_up_out).turn_off();
+              }
+
+              // === Movement detection ===
               std::string movement = "idle";
               bool is_moving = (state != 0x05 && state != 0x44 && state != 0x00);
               if (is_moving && prev >= 0) {
@@ -112,18 +245,9 @@ uart:
               i += 5;
             }
 
-script:
-  - id: safety_block_down
-    mode: restart
-    then:
-      - output.turn_on: btn_up_out
-      - delay: 500ms
-      - if:
-          condition:
-            switch.is_off: btn_up_sw
-          then:
-            - output.turn_off: btn_up_out
-
+# ─────────────────────────────────────────
+# Sensors
+# ─────────────────────────────────────────
 sensor:
   - platform: template
     id: desk_position
@@ -166,6 +290,57 @@ binary_sensor:
       if (std::isnan(id(desk_position).state)) return false;
       return (int)id(desk_position).state <= ${min_ticks};
 
+  - platform: template
+    id: desk_targeting
+    name: "Desk Targeting"
+    icon: mdi:target
+    lambda: 'return id(targeting_active);'
+
+# ─────────────────────────────────────────
+# Number entity - target height w cm
+# Slider w HA, ustawiasz wartość, ESP jedzie
+# ─────────────────────────────────────────
+number:
+  - platform: template
+    name: "Desk Target Height"
+    id: target_height_cm
+    unit_of_measurement: "cm"
+    icon: mdi:human-male-height
+    min_value: ${min_height_cm}
+    max_value: ${max_height_cm}
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 100
+    mode: slider
+    set_action:
+      - lambda: |-
+          int t = (int)((x - ${cm_at_zero}) * ${ticks_per_cm});
+          if (t < ${min_ticks}) t = ${min_ticks};
+          if (t > ${max_ticks}) t = ${max_ticks};
+          id(target_ticks) = t;
+          id(targeting_active) = true;
+          id(target_height_cm).publish_state(x);
+          ESP_LOGI("target", "Set target: %.1f cm = %d ticks", x, t);
+      - switch.turn_off: btn_up_sw
+      - switch.turn_off: btn_down_sw
+
+  - platform: template
+    name: "Desk Inertia Compensation"
+    id: inertia_compensation
+    icon: mdi:tune
+    unit_of_measurement: "ticks"
+    min_value: 0
+    max_value: 300
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 100
+    mode: slider
+
+# ─────────────────────────────────────────
+# Outputs - GPIO open-drain
+# ─────────────────────────────────────────
 output:
   - platform: gpio
     pin: { number: GPIO26, mode: { output: true, open_drain: true } }
@@ -184,6 +359,9 @@ output:
     inverted: true
     id: btn_m2_out
 
+# ─────────────────────────────────────────
+# Switches - HA Up/Down (cancel targeting on manual press)
+# ─────────────────────────────────────────
 switch:
   - platform: template
     name: "Desk Up"
@@ -197,6 +375,8 @@ switch:
               if (std::isnan(id(desk_position).state)) return true;
               return (int)id(desk_position).state < ${max_ticks};
           then:
+            # Cancel targeting on manual override
+            - lambda: 'id(targeting_active) = false;'
             - output.turn_on: btn_up_out
             - delay: ${max_hold_seconds}
             - output.turn_off: btn_up_out
@@ -223,6 +403,7 @@ switch:
               if (std::isnan(id(desk_position).state)) return true;
               return (int)id(desk_position).state > ${min_ticks};
           then:
+            - lambda: 'id(targeting_active) = false;'
             - output.turn_on: btn_down_out
             - delay: ${max_hold_seconds}
             - output.turn_off: btn_down_out
@@ -237,6 +418,9 @@ switch:
     turn_off_action:
       - output.turn_off: btn_down_out
 
+# ─────────────────────────────────────────
+# Memory presety + Stop targeting
+# ─────────────────────────────────────────
 button:
   - platform: template
     name: "Desk M1"
@@ -245,6 +429,7 @@ button:
       - output.turn_on: btn_m1_out
       - delay: 200ms
       - output.turn_off: btn_m1_out
+
   - platform: template
     name: "Desk M2"
     icon: mdi:numeric-2-box
@@ -252,3 +437,11 @@ button:
       - output.turn_on: btn_m2_out
       - delay: 200ms
       - output.turn_off: btn_m2_out
+
+  - platform: template
+    name: "Desk Stop Targeting"
+    icon: mdi:stop-circle
+    on_press:
+      - lambda: 'id(targeting_active) = false;'
+      - output.turn_off: btn_up_out
+      - output.turn_off: btn_down_out
