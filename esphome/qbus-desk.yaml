@@ -162,7 +162,7 @@ uart:
                     id(btn_up_out).turn_off();
                     in_reset_pulse = true;
                     reset_pulse_start = now;
-                    ESP_LOGW("safety", "Stuck %ums, release pulse", stuck_time);
+                    ESP_LOGW("safety", "Stuck %ums, release pulse", (unsigned) stuck_time);
                   } else {
                     id(btn_up_out).turn_on();
                   }
