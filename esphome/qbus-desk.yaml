@@ -245,6 +245,21 @@ uart:
               i += 5;
             }
 
+            // === Raw frame capture (HA toggle: "Desk LIN Capture") ===
+            // When enabled, dumps each UART debug batch as space-separated
+            // hex for offline protocol analysis. Grep the logs for "LINCAP"
+            // and feed the bytes to scripts/sigrok-decode.py. Toggle OFF when
+            // done — at ~190 frames/s this is chatty.
+            if (id(capture_mode).state) {
+              std::string dump;
+              char hb[4];
+              for (size_t k = 0; k < bytes.size(); k++) {
+                sprintf(hb, "%02X ", (unsigned) bytes[k]);
+                dump += hb;
+              }
+              ESP_LOGI("cap", "LINCAP %s", dump.c_str());
+            }
+
 # ─────────────────────────────────────────
 # Sensors
 # ─────────────────────────────────────────
@@ -417,6 +432,15 @@ switch:
                 state: OFF
     turn_off_action:
       - output.turn_off: btn_down_out
+
+  # Raw LIN capture toggle — logs every frame as hex for protocol RE.
+  # Defaults OFF on boot; turn on, exercise the desk, turn off, grab logs.
+  - platform: template
+    name: "Desk LIN Capture"
+    id: capture_mode
+    icon: mdi:record-rec
+    optimistic: true
+    restore_mode: ALWAYS_OFF
 
 # ─────────────────────────────────────────
 # Memory presety + Stop targeting

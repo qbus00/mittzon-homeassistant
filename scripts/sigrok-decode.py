@@ -1,17 +1,54 @@
 #!/usr/bin/env python3
-"""LIN frame decoder for sigrok captures of the Mittzon iDrive bus.
+"""LIN frame decoder for the Mittzon iDrive bus.
 
-Reads raw bytes from stdin (e.g., piped from sigrok-cli) and extracts
-LIN frames: BREAK + SYNC (0x55) + PID + response bytes.
+Accepts two input formats on stdin and auto-detects which one it is:
+
+  1. Raw UART bytes (e.g. piped from sigrok-cli).
+  2. An ESPHome "Desk LIN Capture" log. The capture toggle in
+     qbus-desk.yaml emits one `LINCAP <hex ...>` line per debug batch;
+     this script strips the log/ANSI decoration and rebuilds the byte
+     stream. If the input contains "LINCAP", this mode is used.
+
+Either way it extracts LIN frames: BREAK + SYNC (0x55) + PID + response.
 
 Usage:
+    # Raw bytes from a sigrok capture:
     sigrok-cli -i capture.sr -P uart:baudrate=19200:rx=D0 -B uart | python3 sigrok-decode.py
-    cat raw_bytes.bin | python3 sigrok-decode.py
+
+    # ESPHome capture log (toggle "Desk LIN Capture" on, exercise desk, off):
+    esphome logs qbus-desk.yaml > capture.log
+    python3 sigrok-decode.py < capture.log
 """
 
+import re
 import sys
 import struct
 from collections import defaultdict
+
+# ESPHome logs wrap lines in ANSI color codes; strip them before parsing.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+HEX_BYTE_RE = re.compile(r"^[0-9A-Fa-f]{2}$")
+
+
+def read_input() -> bytes:
+    """Read stdin as either raw UART bytes or an ESPHome LINCAP log."""
+    raw = sys.stdin.buffer.read()
+    if not raw:
+        return b""
+    text = raw.decode("utf-8", errors="replace")
+    if "LINCAP" not in text:
+        return raw  # raw byte stream (sigrok etc.)
+
+    out = bytearray()
+    for line in text.splitlines():
+        idx = line.find("LINCAP")
+        if idx == -1:
+            continue
+        payload = ANSI_RE.sub("", line[idx + len("LINCAP"):])
+        for tok in payload.split():
+            if HEX_BYTE_RE.match(tok):
+                out.append(int(tok, 16))
+    return bytes(out)
 
 
 SYNC_BYTE = 0x55
@@ -94,9 +131,9 @@ def decode_frame(pid: int, data: bytes) -> str:
 
 
 def main():
-    data = sys.stdin.buffer.read()
+    data = read_input()
     if not data:
-        print("No input data. Pipe raw UART bytes to stdin.", file=sys.stderr)
+        print("No input data. Pipe raw UART bytes or an ESPHome LINCAP log to stdin.", file=sys.stderr)
         sys.exit(1)
 
     frame_count = defaultdict(int)
