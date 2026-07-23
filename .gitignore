@@ -6,6 +6,9 @@
 # Secrets
 secrets.yaml
 
+# Local planning / handoff notes (not part of the public repo)
+HANDOFF.md
+
 # macOS
 .DS_Store
 

@@ -26,7 +26,7 @@ Control an IKEA Mittzon standing desk from Home Assistant using an ESP32 wired d
 2. Connect to ESP32 GPIOs in open-drain mode (see [HARDWARE.md](HARDWARE.md))
 3. Tap LIN bus (RJ45 pin 3) directly to GPIO16
 4. Copy `esphome/qbus-desk.yaml` to your ESPHome config directory
-5. Create a `secrets.yaml` with your WiFi credentials, API key, and OTA password
+5. Copy `esphome/secrets.yaml.example` to `esphome/secrets.yaml` and fill in your WiFi credentials, API key, and OTA/AP passwords
 6. Flash and add to Home Assistant
 
 See [HARDWARE.md](HARDWARE.md) for full wiring details and panel teardown instructions.
