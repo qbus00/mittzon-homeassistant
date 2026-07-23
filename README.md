@@ -17,7 +17,7 @@ Control an IKEA Mittzon standing desk from Home Assistant using an ESP32 wired d
 
 ## What doesn't work (yet)
 
-- Full LIN bus control (iDrive proprietary checksum not cracked — see [PROTOCOL.md](PROTOCOL.md))
+- Full LIN bus control — the checksum turned out to be standard LIN enhanced (solved), but native control is still blocked by the open-collector physical layer and an unmapped command channel (see [PROTOCOL.md](PROTOCOL.md))
 - Panel LED status reading
 
 ## Quick start

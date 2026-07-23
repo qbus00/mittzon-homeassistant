@@ -32,6 +32,8 @@ The iDrive protocol uses a proprietary checksum on at least some PIDs. Standard 
 
 Without the checksum, we can't construct valid frames. We tried XOR variants, CRC-8 polynomials, and sum-with-seed approaches. Nothing matched.
 
+> **Update (2026):** This conclusion was wrong. A later ESPHome re-capture showed the checksum is plain **LIN enhanced** all along — the mismatch came from reading the frame payload at the wrong byte offset, not from a proprietary algorithm. Correctly framed, all 734 payload frames verify. See [PROTOCOL.md](PROTOCOL.md). The physical-layer (open-collector AND) limit described below still stands, so this doesn't by itself make injection possible.
+
 ## Attempt 2: Hardware MITM bridge
 
 If we can't crack the checksum, maybe we don't need to. The plan: sit between the controller and panel, forward everything transparently, but swap out PID 0x92 responses when we want to inject commands.
@@ -77,7 +79,7 @@ The master sees `0x00` — garbage. Frame rejected. Panel LED blinks to signal a
 
 Even in the MITM configuration, the panel is still connected to its side of the bus and actively responding. We'd need to electrically disconnect the panel's transmitter during injection — a MOSFET switch on the panel TX line, triggered with microsecond precision in the gap between the master's PID poll and the panel's response.
 
-Plus, the ESP would need to respond correctly to all PIDs the panel currently handles (we only decoded ~4 of ~8 needed), with the correct iDrive checksum that we haven't cracked.
+Plus, the ESP would need to respond correctly to all PIDs the panel currently handles (we only decoded ~4 of ~8 needed), with correct checksums — which we later found to be standard LIN enhanced (see the update above), so that part is now solved.
 
 This approach is theoretically possible but requires significantly more hardware and reverse engineering. We pivoted.
 

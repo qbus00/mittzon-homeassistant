@@ -1,122 +1,139 @@
 # LIN Bus Protocol Findings
 
-Reverse engineering notes for the iDrive/LIN protocol used between the IKEA Mittzon standing desk's ROL Group controller and handset panel.
+Reverse engineering notes for the LIN protocol used between the IKEA Mittzon standing desk's ROL Group controller and handset panel.
+
+> **2026 update:** An ESPHome-based re-capture (the "Desk LIN Capture" toggle in `esphome/qbus-desk.yaml`) corrected two earlier mistakes:
+> 1. Desk **position lives in the first two payload bytes**, not bytes 2–3 as the original notes claimed.
+> 2. The checksum is **standard LIN enhanced** — there is no proprietary "iDrive" algorithm. The proprietary-checksum conclusion was an artifact of misframing the payload. All 734 payload-bearing frames in the re-capture verify against LIN enhanced.
 
 ## Bus characteristics
 
 - **Baud rate:** 19200
 - **Format:** 8N1
 - **Physical layer:** Single-wire LIN-like bus on RJ45 pin 3
-- **Topology:** Multi-master (controller + panel both transmit)
-- **Frame structure:** BREAK + SYNC (0x55) + PID + response bytes
+- **Topology:** Controller is master (polls every PID); panel answers a subset
+- **Frame structure:** BREAK + SYNC (0x55) + PID + data bytes + checksum
 
 ## PID schedule
 
-The master (controller) continuously polls 12 PIDs in a cyclic schedule:
+The master (controller) continuously polls 12 PIDs in a cyclic schedule. In an idle/steady capture only four carry a data response; the rest are polled but return no payload — either no slave answers, or the slave only answers when it has something to report (e.g. a button press).
 
-| PID | Approx. rate | Notes |
+| PID | Approx. rate | Response in idle/steady capture |
 |---|---|---|
-| 0x03 | ~10/s | Unknown payload |
-| 0x06 | ~10/s | Unknown payload |
-| 0x08 | ~10/s | Position data (encoder ticks) |
-| 0x11 | ~10/s | Constant response |
-| 0x42 | ~10/s | Unknown payload |
-| 0x47 | ~10/s | Unknown payload |
-| 0x50 | **~70/s** | High-frequency filler/keepalive |
-| 0x80 | ~10/s | Constant response |
-| 0x85 | ~10/s | Unknown payload |
-| 0x92 | ~10/s | Movement state + position |
-| 0xC1 | ~10/s | Unknown payload |
-| 0xC4 | ~10/s | Unknown payload |
+| 0x03 | ~10/s | none |
+| 0x06 | ~10/s | none |
+| 0x08 | ~10/s | position + flag |
+| 0x11 | ~10/s | constant |
+| 0x42 | ~10/s | none |
+| 0x47 | ~10/s | none |
+| 0x50 | **~70/s** | none (keepalive header) |
+| 0x80 | ~10/s | constant |
+| 0x85 | ~10/s | none |
+| 0x92 | ~10/s | position + status |
+| 0xC1 | ~10/s | none |
+| 0xC4 | ~10/s | none |
 
 Total bus utilization: ~190 frames/second.
 
-## Decoded responses
+The seven "none" PIDs are the prime suspects for carrying the panel's button/preset commands — they were empty only because no button was pressed while they happened to be polled. Confirming this needs targeted single-action captures (hold UP only, hold DOWN only, recall M1, recall M2).
 
-### PID 0x80 — Constant
+## Frame layouts
 
-- **Payload:** `0x00 0x00 0x00 0x7F` (4 bytes)
-- **Checksum:** Matches LIN enhanced checksum for PID 0x80
-- Always the same value, likely a status register or capability advertisement
+Every multi-byte frame ends with a LIN enhanced checksum (see below). Position is a little-endian uint16 in the **first two payload bytes**.
 
-### PID 0x11 — Constant
+### PID 0x92 — position + status
 
-- **Payload:** `0x00 0xEE` (2 bytes)
-- **Checksum:** Matches LIN enhanced checksum for PID 0x11
-- Static, unknown purpose
+```
+posL posH status CHK
+```
 
-### PID 0x92 — Movement state (panel → controller)
+- **posL posH:** position, little-endian uint16, encoder ticks
+- **status:** a state/phase byte. Observed values and counts in one up-then-down capture:
 
-The most interesting PID. This is the panel telling the controller what the user is doing.
+| Status | Count | Context (tentative) |
+|---|---|---|
+| 0x44 | 79 | steady / at rest |
+| 0x06 | 53 | — |
+| 0x05 | 43 | — |
+| 0x07 | 6 | around motion |
+| 0x04 | 2 | around motion |
 
-- **Idle:** `0x05 0x94 0xFE` (3 bytes)
-- **UP pressed:** `0x0A` (1 byte)
-- **DOWN pressed:** Not captured (panel was silent during DOWN in our sigrok sessions)
+The same status values appear while moving **both** up and down, so this byte looks like a motion/phase status **reported by the controller**, not a directional button command. (Position is something only the controller's encoder knows, which reinforces that 0x92 is controller→panel status.) Exact semantics are not yet confirmed.
 
-**Byte 0** encodes the button state:
-| Value | Meaning |
+### PID 0x08 — position + flag
+
+```
+posL posH flag CHK
+```
+
+- **posL posH:** position, little-endian uint16, encoder ticks (same value as 0x92 in the same poll cycle)
+- **flag:** 0x00 or 0x02 (purpose unconfirmed)
+
+Position range in the sample capture: 1668–3279 ticks (76.5–92.1 cm). Calibration: 102.93 ticks/cm, zero offset 60.29 cm. Full physical range is ~888–6669 ticks.
+
+### PID 0x11 — constant
+
+`00 00 00 CHK` → `00 00 00 EE`
+
+### PID 0x80 — constant
+
+`00 00 00 00 00 00 00 00 CHK` → `… 7F`
+
+## Checksum — standard LIN enhanced
+
+The checksum is the **LIN enhanced checksum**: the inverted, carry-folded 8-bit sum of the **protected ID (PID) plus all data bytes**.
+
+```
+sum = PID + data[0] + data[1] + ...
+while sum > 0xFF:
+    sum = (sum & 0xFF) + (sum >> 8)   # carry fold
+checksum = (~sum) & 0xFF
+```
+
+Worked examples from the capture:
+
+- PID `0x08`, data `84 06 00`, chk `6D`: `0x08 + 0x84 + 0x06 + 0x00 = 0x92`, `~0x92 = 0x6D` ✓
+- PID `0x92`, data `84 06 44`, chk `9E`: `0x92 + 0x84 + 0x06 + 0x44 = 0x160` → fold → `0x61` → `~0x61 = 0x9E` ✓
+
+Verified across the entire ESPHome capture:
+
+| PID | Frames matching LIN enhanced |
 |---|---|
-| 0x05 | Idle (no button pressed) |
-| 0x0A | UP button pressed |
-| 0x44 | Observed during settling |
-| 0x00 | Observed during transitions |
+| 0x08 | 184 / 184 |
+| 0x11 | 184 / 184 |
+| 0x80 | 183 / 183 |
+| 0x92 | 183 / 183 |
+| **Total** | **734 / 734** |
 
-The trailing bytes in the idle response (`0x94 0xFE`) do not match any standard LIN checksum algorithm (see below).
+### Why the original analysis thought it was proprietary
 
-### PID 0x08 — Position data
-
-- **Payload:** 2-4 bytes, variable length
-- **Bytes [2:3]** (when present): Little-endian uint16 = encoder ticks
-- Position range observed: ~888 (lowest) to ~6669 (highest)
-- Calibration: 102.93 ticks/cm, zero offset 60.29 cm
-
-## Checksum analysis
-
-Standard LIN defines two checksum variants:
-- **Classic checksum:** Sum of data bytes + carry folding, inverted
-- **Enhanced checksum:** Same, but includes the PID in the sum
-
-Results across PIDs:
-
-| PID | Classic match | Enhanced match | Notes |
-|---|---|---|---|
-| 0x80 | No | **Yes** | 4-byte constant response |
-| 0x11 | No | **Yes** | 2-byte constant response |
-| 0x92 | No | No | **iDrive proprietary** |
-| 0x08 | Partial | Partial | Some frames match, others don't |
-
-The iDrive protocol appears to use enhanced checksums for some PIDs but a proprietary algorithm for others (notably 0x92). We did not crack the proprietary checksum.
+The earlier sigrok-based notes read position from the wrong byte offset and treated the leftover bytes as the payload, so the byte set fed into the checksum was wrong — and naturally never matched LIN classic or enhanced. That produced the "proprietary iDrive checksum" conclusion. There is no proprietary checksum; it is textbook LIN enhanced.
 
 ## Capture methodology
 
-- **Tool:** sigrok-cli with a 24MHz/4MHz USB logic analyzer on Mac M1
-- **Decoder:** Custom Python script (`scripts/sigrok-decode.py`) with BREAK detection, SYNC validation, and per-PID response extraction
-- **LIN tap:** RJ45 pin 3 wired directly to logic analyzer / ESP32 GPIO16 (RX only)
-- **Sessions:** Multiple captures at different desk states (idle, moving up, moving down, preset recall)
+Two capture paths have been used:
 
-Raw `.sr` capture files are no longer available.
+- **ESPHome (current):** `esphome/qbus-desk.yaml` has a "Desk LIN Capture" toggle that hex-dumps every frame (log tag `LINCAP`) over the network log stream. Continuous, byte-aligned, and trivial to reproduce for every desk state. Decode with `scripts/sigrok-decode.py`, which auto-detects a LINCAP log.
+- **sigrok (original):** sigrok-cli with a 24MHz/4MHz USB logic analyzer on Mac M1, tapping RJ45 pin 3. Raw `.sr` files from those sessions are no longer available.
 
-## Why LIN injection failed
+## Why LIN injection still isn't trivial
 
-The LIN bus uses an open-collector physical layer. Every transmitter on the bus can pull the line LOW but not drive it HIGH (the bus pull-up resistor does that). The bus state is the bitwise AND of all transmitters' outputs.
-
-When the panel sends `0x05` (idle) and the ESP simultaneously sends `0x0A` (UP):
+Cracking the checksum removes the *encoding* blocker, not the *physical* one. The LIN bus is open-collector: every transmitter can pull the line LOW but not drive it HIGH, so the bus is the bitwise AND of all transmitters. You cannot override the panel's response by adding a second transmitter — the panel's zeros win.
 
 ```
-Panel output:  0x05  =  0000 0101
-ESP output:    0x0A  =  0000 1010
-Bus result:    AND   =  0000 0000  =  0x00
+Panel:  0x05 = 0000 0101
+ESP:    0x0A = 0000 1010
+Bus:    AND  = 0000 0000   ← corrupt frame
 ```
 
-The master sees `0x00` — a corrupt frame. It rejects it, and the panel's LED blinks (bus error detected).
+So native control still requires **removing the panel from the response slot**, one of:
 
-**This is not a timing or implementation problem. It's a fundamental physical constraint.** You cannot override another active transmitter on an open-collector bus. The only way to inject is to physically disconnect the panel from the bus during the injection window.
+1. **Replace the panel** — unplug it; ESP + a LIN transceiver answers every PID the controller expects. Needs the full set of panel-sourced PIDs and their data (the checksum is now known).
+2. **Mute the panel's TX** — a MOSFET/analog switch that disconnects the panel during the specific response slot the ESP wants to own, with tight timing.
 
-## What would unlock full LIN control
+## Open questions
 
-1. **Hardware switch** (MOSFET or analog mux) to disconnect panel TX from the bus during ESP injection windows
-2. **Full PID response coverage** — ESP must respond to all ~8 PIDs that currently get panel responses (we only decoded ~4)
-3. **Correct iDrive checksum** for PID 0x92 — without this, the controller rejects injected movement commands
-4. **Timing precision** — responses must arrive within the controller's timeout window after each PID poll
-
-This is achievable but requires significantly more hardware and reverse engineering effort than the button emulation approach.
+1. **Which PID carries the button/preset command?** Likely one of the currently-empty PIDs; needs targeted UP-only / DOWN-only / M1 / M2 captures.
+2. **Source direction per PID** — controller-sourced vs panel-sourced. A capture with the panel unplugged (ESP still RX-tapped) settles this: PIDs still answered are controller-sourced; those that go silent are panel-sourced.
+3. **0x92 status-byte semantics** and the **0x08 flag byte**.
+4. Whether presets (M1/M2) issue a bus-visible "go to height" command — the path to the controller's native ~0.1 cm precision.

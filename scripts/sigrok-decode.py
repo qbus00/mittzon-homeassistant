@@ -22,7 +22,6 @@ Usage:
 
 import re
 import sys
-import struct
 from collections import defaultdict
 
 # ESPHome logs wrap lines in ANSI color codes; strip them before parsing.
@@ -90,17 +89,19 @@ def lin_checksum_classic(data: bytes) -> int:
 
 
 def decode_pid_0x92(data: bytes) -> str:
-    if not data:
-        return "empty"
-    state = data[0]
-    states = {0x05: "idle", 0x0A: "UP", 0x44: "settling", 0x00: "transition"}
-    return states.get(state, f"unknown(0x{state:02X})")
+    # Frame: posL posH status CHK  (position little-endian in bytes 0-1).
+    # status is a controller-reported motion/phase byte; semantics TBD.
+    if len(data) >= 3:
+        pos = data[0] | (data[1] << 8)
+        return f"pos={pos} ticks status=0x{data[2]:02X}"
+    return "empty" if not data else f"{len(data)} bytes"
 
 
 def decode_pid_0x08(data: bytes) -> str:
-    if len(data) >= 4:
-        pos = struct.unpack_from("<H", data, 2)[0]
-        return f"position={pos} ticks"
+    # Frame: posL posH flag CHK  (position little-endian in bytes 0-1).
+    if len(data) >= 3:
+        pos = data[0] | (data[1] << 8)
+        return f"pos={pos} ticks flag=0x{data[2]:02X}"
     return f"{len(data)} bytes"
 
 
