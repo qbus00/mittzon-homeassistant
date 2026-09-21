@@ -137,3 +137,48 @@ So native control still requires **removing the panel from the response slot**, 
 2. **Source direction per PID** — controller-sourced vs panel-sourced. A capture with the panel unplugged (ESP still RX-tapped) settles this: PIDs still answered are controller-sourced; those that go silent are panel-sourced.
 3. **0x92 status-byte semantics** and the **0x08 flag byte**.
 4. Whether presets (M1/M2) issue a bus-visible "go to height" command — the path to the controller's native ~0.1 cm precision.
+
+## Frame format on the Holtek BS86C16A-3 panel variant
+
+On the hardware variant described in
+[HARDWARE-VARIANTS.md](HARDWARE-VARIANTS.md) (Seeed XIAO ESP32-C3 + a panel
+built around a Holtek BS86C16A-3), the UART traffic on the panel's real data
+pin (PA3) does **not** use the `0x55 0x92` frame sync documented above for
+the original hardware.
+
+Captured frames instead consistently start with:
+
+```
+18 18 06 1E
+```
+
+followed by 6-8 more bytes depending on frame length (observed lengths: 10,
+11, and 12 bytes total, including a trailing `FE`). Example captures, taken
+while driving the desk up and down (`LINCAP` = raw hex dump from the
+project's "Desk LIN Capture" debug switch):
+
+```
+18 18 06 1E 18 E0 9E 7E 86 86 FE
+18 18 06 1E 18 E6 9E 7E 98 86 FE
+18 18 06 1E 1E 66 7E 1E 60 FE
+18 18 06 1E 60 00 7E FE 80 F8 FE
+```
+
+The byte immediately after the `18 18 06 1E` header changes slowly over the
+course of a full desk travel (values like `0x18`, `0x1E`, `0x60` were seen at
+different heights), which suggests it's part of a coarse position/state
+field — but across a full up/down cycle it only took ~3 distinct values,
+which is far too coarse to be a real per-tick position counter. No other
+fixed byte offset showed a clean monotonic relationship with height in the
+captures analyzed, likely because frame length itself varies (10-12 bytes),
+which breaks any fixed-offset assumption once frames are shorter or longer
+than expected.
+
+**Status: unresolved.** Position/height tracking on this panel variant is an
+open problem — the button-tap control (UP/DOWN/M1/M2) works fine and doesn't
+depend on this, but anyone wanting live height reporting on this specific
+panel will need a proper logic-analyzer capture (rather than ESPHome's own
+UART debug logging, which can drop or coalesce bytes under load) to nail
+down the real frame structure. Frame length varying by state may also mean
+there's a length/type byte inside the header that determines how to parse
+the rest of the frame, which wasn't accounted for in this analysis.
