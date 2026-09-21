@@ -43,6 +43,10 @@ No reflash needed — the slider is a runtime HA entity.
 
 ## Hardware
 
+> Have a different panel or MCU? See [HARDWARE-VARIANTS.md](HARDWARE-VARIANTS.md)
+> for community-documented alternatives (currently: Seeed XIAO ESP32-C3 +
+> Holtek BS86C16A-3 panel).
+
 - ESP32 WROOM-32 DevKit
 - Thin silicone wires (AWG28-30)
 - Powered directly from ROL desk controller 5V rail
@@ -112,7 +116,9 @@ The protocol findings (decoded PIDs, frame formats, what remains unsolved) are i
 ├── PROTOCOL.md        # iDrive/LIN bus findings
 ├── JOURNEY.md         # Full story including failed attempts
 ├── esphome/
-│   └── qbus-desk.yaml # Final working ESPHome config
+│   ├── qbus-desk.yaml          # Final working ESPHome config
+│   └── qbus-desk-xiao-c3.yaml  # Variant: XIAO ESP32-C3 + Holtek panel (see HARDWARE-VARIANTS.md)
+├── HARDWARE-VARIANTS.md        # Alternate MCU/panel hardware (community-contributed)
 ├── scripts/
 │   ├── sigrok-decode.py # LIN frame decoder for sigrok captures
 │   └── lin-analyze.py   # Per-second PID rate analysis
