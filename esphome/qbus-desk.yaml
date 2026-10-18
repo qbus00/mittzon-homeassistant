@@ -69,6 +69,14 @@ globals:
     restore_value: no
     initial_value: 'false'
 
+  # Latched read-only mode. Starts TRUE (fail-safe): the ESP presses nothing
+  # until a plausible position has been seen for 3 s. Re-latches whenever the
+  # desk reports "no reference" (0xFF00) or position 0.
+  - id: readonly_mode
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
 # ─────────────────────────────────────────
 # LIN RX - monitor + end-stop + auto-recovery + targeting
 # ─────────────────────────────────────────
@@ -95,6 +103,8 @@ uart:
             constexpr int   HYSTERESIS   = 30;
             constexpr uint32_t STUCK_TIMEOUT_MS = 1500;
             constexpr uint32_t RESET_PULSE_MS  = 500;
+            constexpr uint16_t POS_INVALID = 0xFF00;
+            constexpr uint32_t RO_EXIT_MS = 3000;
 
             static uint32_t last_motion_time = 0;
             static int      last_recorded_pos = -1;
@@ -105,25 +115,113 @@ uart:
             static int      target_initial_pos = -1;
             static bool     target_was_active = false;
 
+            // Read-only / diagnostics state
+            static uint32_t valid_since = 0;
+            static int      last_status = -2, last_flag = -2;
+            static int      last_no_ref = -1, last_ro = -1;
+            static int      last_pub_pos = -2;
+
+            // LIN enhanced checksum over PID + payload
+            auto lin_ok = [](uint8_t pid, const uint8_t *d, size_t n, uint8_t chk) {
+              uint16_t s = pid;
+              for (size_t k = 0; k < n; k++) s += d[k];
+              while (s > 0xFF) s = (s & 0xFF) + (s >> 8);
+              return (uint8_t)(~s) == chk;
+            };
+
             for (size_t i = 0; i + 5 < bytes.size(); i++) {
-              if (bytes[i] != 0x55 || bytes[i+1] != 0x92) continue;
+              if (bytes[i] != 0x55) continue;
+              uint8_t pid = bytes[i+1];
+              if (pid != 0x92 && pid != 0x08) continue;
+              if (!lin_ok(pid, &bytes[i+2], 3, bytes[i+5])) continue;
 
               uint16_t pos   = (uint16_t(bytes[i+3]) << 8) | bytes[i+2];
               uint8_t  state = bytes[i+4];
 
-              if (pos > 20000) { i += 5; continue; }
+              // PID 0x08: only log flag changes (diagnostics)
+              if (pid == 0x08) {
+                if ((int)state != last_flag) {
+                  last_flag = (int)state;
+                  ESP_LOGI("lin", "0x08 flag -> 0x%02X (pos 0x%04X)", state, pos);
+                }
+                i += 5;
+                continue;
+              }
+
+              // ---- PID 0x92 ----
+              uint32_t now = millis();
+              bool no_ref = (pos == POS_INVALID);
+
+              if ((int)no_ref != last_no_ref) {
+                last_no_ref = (int)no_ref;
+                id(needs_calibration).publish_state(no_ref);
+                if (no_ref) ESP_LOGW("lin", "0x92 position 0x%04X = no reference, needs calibration", pos);
+              }
+              if ((int)state != last_status) {
+                last_status = (int)state;
+                char s[8];
+                snprintf(s, sizeof(s), "0x%02X", state);
+                id(desk_status).publish_state(s);
+                ESP_LOGI("lin", "0x92 status -> 0x%02X (pos 0x%04X)", state, pos);
+              }
+
+              // Latch read-only on implausible position; release only after a
+              // plausible one has been stable for RO_EXIT_MS.
+              if (no_ref || pos == 0) {
+                if (!id(readonly_mode)) ESP_LOGW("safety", "Read-only latched (pos 0x%04X)", pos);
+                id(readonly_mode) = true;
+                valid_since = 0;
+              } else if ((int)pos >= MIN_TICKS && (int)pos <= MAX_TICKS) {
+                if (valid_since == 0) valid_since = now;
+                if (id(readonly_mode) && now - valid_since >= RO_EXIT_MS) {
+                  id(readonly_mode) = false;
+                  ESP_LOGW("safety", "Plausible position (%u), read-only released", pos);
+                }
+              } else {
+                valid_since = 0;
+              }
+
+              bool ro = id(readonly_mode) || id(force_readonly).state;
+              if ((int)ro != last_ro) {
+                last_ro = (int)ro;
+                id(readonly_active).publish_state(ro);
+              }
+
+              if (no_ref) {
+                // No usable position: never publish, never act.
+                id(btn_up_out).turn_off();
+                id(btn_down_out).turn_off();
+                id(targeting_active) = false;
+                target_was_active = false;
+                in_reset_pulse = false;
+                i += 5;
+                continue;
+              }
 
               float height_cm = (float)pos / TICKS_PER_CM + CM_AT_ZERO;
-              id(desk_position).publish_state(pos);
-              id(desk_height).publish_state(height_cm);
+              if ((int)pos != last_pub_pos) {
+                last_pub_pos = (int)pos;
+                id(desk_position).publish_state(pos);
+                id(desk_height).publish_state(height_cm);
+              }
 
               int prev = id(prev_position);
-              uint32_t now = millis();
 
               if (last_recorded_pos != (int)pos) {
                 last_recorded_pos = (int)pos;
                 last_motion_time = now;
               }
+
+              if (ro) {
+                // READ-ONLY: release every output, drop targeting, run nothing else.
+                id(btn_up_out).turn_off();
+                id(btn_down_out).turn_off();
+                if (id(btn_up_sw).state) id(btn_up_sw).turn_off();
+                if (id(btn_down_sw).state) id(btn_down_sw).turn_off();
+                id(targeting_active) = false;
+                target_was_active = false;
+                in_reset_pulse = false;
+              } else {
 
               // === End-stop ESP-driven motion (HA switches) ===
               if ((int)pos >= MAX_TICKS && id(btn_up_sw).state) {
@@ -228,6 +326,8 @@ uart:
                 id(btn_up_out).turn_off();
               }
 
+              }  // end !ro
+
               // === Movement detection ===
               std::string movement = "idle";
               bool is_moving = (state != 0x05 && state != 0x44 && state != 0x00);
@@ -288,6 +388,12 @@ text_sensor:
     lambda: 'return std::string("idle");'
     update_interval: never
 
+  - platform: template
+    id: desk_status
+    name: "Desk LIN Status"
+    icon: mdi:information-outline
+    update_interval: never
+
 binary_sensor:
   - platform: template
     id: desk_at_top
@@ -311,6 +417,18 @@ binary_sensor:
     icon: mdi:target
     lambda: 'return id(targeting_active);'
 
+  # Desk reports 0xFF00 = no reference, needs calibration
+  - platform: template
+    id: needs_calibration
+    name: "Desk Needs Calibration"
+    device_class: problem
+
+  # ESP is not allowed to press anything (latched or forced)
+  - platform: template
+    id: readonly_active
+    name: "Desk Read-Only Active"
+    icon: mdi:lock
+
 # ─────────────────────────────────────────
 # Number entity - target height w cm
 # Slider w HA, ustawiasz wartość, ESP jedzie
@@ -329,16 +447,22 @@ number:
     initial_value: 100
     mode: slider
     set_action:
-      - lambda: |-
-          int t = (int)((x - ${cm_at_zero}) * ${ticks_per_cm});
-          if (t < ${min_ticks}) t = ${min_ticks};
-          if (t > ${max_ticks}) t = ${max_ticks};
-          id(target_ticks) = t;
-          id(targeting_active) = true;
-          id(target_height_cm).publish_state(x);
-          ESP_LOGI("target", "Set target: %.1f cm = %d ticks", x, t);
-      - switch.turn_off: btn_up_sw
-      - switch.turn_off: btn_down_sw
+      - if:
+          condition:
+            lambda: 'return !(id(readonly_mode) || id(force_readonly).state);'
+          then:
+            - lambda: |-
+                int t = (int)((x - ${cm_at_zero}) * ${ticks_per_cm});
+                if (t < ${min_ticks}) t = ${min_ticks};
+                if (t > ${max_ticks}) t = ${max_ticks};
+                id(target_ticks) = t;
+                id(targeting_active) = true;
+                id(target_height_cm).publish_state(x);
+                ESP_LOGI("target", "Set target: %.1f cm = %d ticks", x, t);
+            - switch.turn_off: btn_up_sw
+            - switch.turn_off: btn_down_sw
+          else:
+            - logger.log: "Target ignored - read-only mode"
 
   - platform: template
     name: "Desk Inertia Compensation"
@@ -387,6 +511,7 @@ switch:
       - if:
           condition:
             lambda: |-
+              if (id(readonly_mode) || id(force_readonly).state) return false;
               if (std::isnan(id(desk_position).state)) return true;
               return (int)id(desk_position).state < ${max_ticks};
           then:
@@ -399,7 +524,7 @@ switch:
                 id: btn_up_sw
                 state: OFF
           else:
-            - logger.log: "Desk Up blocked - at top limit"
+            - logger.log: "Desk Up blocked - top limit or read-only"
             - switch.template.publish:
                 id: btn_up_sw
                 state: OFF
@@ -415,6 +540,7 @@ switch:
       - if:
           condition:
             lambda: |-
+              if (id(readonly_mode) || id(force_readonly).state) return false;
               if (std::isnan(id(desk_position).state)) return true;
               return (int)id(desk_position).state > ${min_ticks};
           then:
@@ -426,12 +552,20 @@ switch:
                 id: btn_down_sw
                 state: OFF
           else:
-            - logger.log: "Desk Down blocked - at bottom limit"
+            - logger.log: "Desk Down blocked - bottom limit or read-only"
             - switch.template.publish:
                 id: btn_down_sw
                 state: OFF
     turn_off_action:
       - output.turn_off: btn_down_out
+
+  # Manual override: keeps the ESP read-only regardless of desk state.
+  - platform: template
+    name: "Desk Force Read-Only"
+    id: force_readonly
+    icon: mdi:lock-outline
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
 
   # Raw LIN capture toggle — logs every frame as hex for protocol RE.
   # Defaults OFF on boot; turn on, exercise the desk, turn off, grab logs.
@@ -450,17 +584,25 @@ button:
     name: "Desk M1"
     icon: mdi:numeric-1-box
     on_press:
-      - output.turn_on: btn_m1_out
-      - delay: 200ms
-      - output.turn_off: btn_m1_out
+      - if:
+          condition:
+            lambda: 'return !(id(readonly_mode) || id(force_readonly).state);'
+          then:
+            - output.turn_on: btn_m1_out
+            - delay: 200ms
+            - output.turn_off: btn_m1_out
 
   - platform: template
     name: "Desk M2"
     icon: mdi:numeric-2-box
     on_press:
-      - output.turn_on: btn_m2_out
-      - delay: 200ms
-      - output.turn_off: btn_m2_out
+      - if:
+          condition:
+            lambda: 'return !(id(readonly_mode) || id(force_readonly).state);'
+          then:
+            - output.turn_on: btn_m2_out
+            - delay: 200ms
+            - output.turn_off: btn_m2_out
 
   - platform: template
     name: "Desk Stop Targeting"

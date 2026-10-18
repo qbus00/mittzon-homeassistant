@@ -79,6 +79,23 @@ Position range in the sample capture: 1668–3279 ticks (76.5–92.1 cm). Calibr
 
 `00 00 00 00 00 00 00 00 CHK` → `… 7F`
 
+## Error / calibration state (desk shows orange)
+
+Observed on a desk that dropped into the "calibrate me" state. All frames still pass the LIN enhanced checksum, so the bus itself is healthy.
+
+| PID | Payload | Meaning (tentative) |
+|---|---|---|
+| 0x92 | `00 FF 44` | position **0xFF00** = no reference, status 0x44 |
+| 0x08 | `00 FF 00` | position 0xFF00, flag 0x00 |
+
+While the handset was being recalibrated the following was logged (via `Desk LIN Capture` plus the change-only `lin` log):
+
+- 0x92 `00 00 05` and 0x08 flag `0x04` appear mixed into the 0xFF00 frames: position 0, status 0x05, while a button is pressed.
+- 0x08 then reports rising positions (`0x0048` … `0x008D`, flag 0x00) while the desk drives, then 0x92 status 0x04 (moving) at `0x0063` … `0x008D`, and finally the normal rest status 0x44 at `0x008D`.
+- Flags seen on 0x08: 0x00, 0x01, 0x02, 0x04. Statuses seen on 0x92: 0x04, 0x05, 0x06, 0x44.
+
+Position 0x0000 and 0xFF00 are therefore not real heights; the firmware treats both as "do not touch the buttons". The earlier firmware silently dropped 0xFF00 frames (`pos > 20000`) and, on position 0, its below-minimum auto-recovery held UP, which fights a manual recalibration on the handset (two buttons = stop).
+
 ## Checksum — standard LIN enhanced
 
 The checksum is the **LIN enhanced checksum**: the inverted, carry-folded 8-bit sum of the **protected ID (PID) plus all data bytes**.
