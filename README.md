@@ -97,6 +97,14 @@ RJ45 GND  ------------ ESP32 GND
 | Desk At Soft Bottom | Binary Sensor | At lower soft limit |
 | Desk Targeting | Binary Sensor | True while driving toward target |
 | Desk Stop Targeting | Button | Abort current go-to-position |
+| Desk Needs Calibration | Binary Sensor | Desk reports no position reference (0xFF00) |
+| Desk Read-Only Active | Binary Sensor | ESP is not allowed to press any button (see below) |
+| Desk Force Read-Only | Switch | Keep the ESP read-only regardless of desk state |
+| Desk LIN Status | Text Sensor | Raw status byte of PID 0x92 (diagnostics) |
+
+### Read-only mode
+
+The ESP only drives the panel buttons while the desk reports a plausible position. It starts **read-only** after every boot and releases only once a position between `min_ticks` and `max_ticks` has been stable for 3 s. It latches back to read-only when the desk reports position `0` or `0xFF00` (no reference, orange "calibrate me" state). While read-only, all outputs are released and Up/Down/M1/M2/target commands are ignored, so you can recalibrate the desk from the handset without the ESP pressing buttons in parallel. Note that if `min_ticks` is higher than the height the desk reports after calibration, read-only stays on until you move the desk above `min_ticks`.
 
 ## The journey
 

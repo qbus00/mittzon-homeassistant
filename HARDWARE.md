@@ -78,6 +78,22 @@ GND ------------------- ESP32 GND
 - Pressing a button shorts the signal pad to GND
 - This is exactly what our ESP32 GPIO replicates in open-drain mode
 
+### Test points on the handset PCB
+
+Instead of cutting the original RJ45 cable, everything can be tapped at test points on the handset PCB (measured on a real panel):
+
+| Test point | Signal | ESP32 |
+|---|---|---|
+| TP5 | M1 button pad | GPIO33 |
+| TP6 | UP button pad | GPIO26 |
+| TP7 | DOWN button pad | GPIO27 |
+| TP8 | M2 button pad | GPIO32 |
+| TP10 | 5V | VIN |
+| TP12 | LIN bus | GPIO16 (UART2 RX) |
+| any GND point | GND | GND |
+
+Verify the pads with a multimeter before soldering: the button pads idle at 3.3V and the LIN line idles near the supply voltage.
+
 ### Soldering the taps
 
 Solder one thin wire to each of the 4 button signal pads (UP, DOWN, M1, M2) and one to any GND point on the PCB. Route the wires out through the cable channel.
